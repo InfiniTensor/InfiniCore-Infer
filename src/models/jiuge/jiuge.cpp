@@ -8,6 +8,8 @@
 #include <random>
 #include <thread>
 #include <vector>
+#include <iostream>
+#include <iomanip>
 
 void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
                           const JiugeWeights *weights,
@@ -41,7 +43,13 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
             getFFNDown(meta, weights, layer, idev, ndev));
     }
 
-    auto memory_pool = std::make_shared<MemoryPool>(128 * 1024 * 1024);
+    // 配置内存池预分配策略
+    MemoryPool::PreallocationConfig pool_config;
+    pool_config.small_pool_size = 32 * 1024 * 1024;   // 32MB for small allocations
+    pool_config.medium_pool_size = 64 * 1024 * 1024;  // 64MB for medium allocations  
+    pool_config.large_pool_size = 128 * 1024 * 1024;  // 128MB for large allocations
+    
+    auto memory_pool = std::make_shared<MemoryPool>(128 * 1024 * 1024, MemoryPool::DEFAULT_ALIGNMENT, pool_config);
 
     *rsrc = DeviceResource{
         device,
@@ -117,6 +125,15 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                       struct KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
                       uint32_t *output) {
+    // 推理开始前检查内存状态
+    static int inference_count = 0;
+    inference_count++;
+    
+    // 每10次推理检查一次碎片率，必要时进行碎片整理
+    if (inference_count % 10 == 0 && rsrc.memory_pool->shouldDefragment()) {
+        rsrc.memory_pool->defragment();
+    }
+    
     auto nlayer = meta.nlayer;
     auto nkvh = meta.nkvh / ndev;
     auto nh = meta.nh / ndev;
