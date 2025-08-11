@@ -1,4 +1,5 @@
 from jiuge import JiugeForCauslLM
+from tinymix import TinyMixForCauslLM
 from libinfinicore_infer import DeviceType
 from infer_task import InferTask
 from kvcache_pool import KVCachePool
@@ -30,7 +31,15 @@ def parse_args():
     parser.add_argument(
         "--model-path",
         type=str,
+        required=True,
         help="Path to the model directory",
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        choices=["jiuge", "tinymix"],
+        default="jiuge",
+        help="Type of model to load (default: jiuge)",
     )
     parser.add_argument(
         "--dev",
@@ -65,6 +74,7 @@ device_type = DEVICE_TYPE_MAP[args.dev]
 model_path = args.model_path
 ndev = args.ndev
 max_tokens = args.max_tokens
+model_type = args.model_type
 
 MAX_BATCH = args.max_batch
 print(
@@ -81,7 +91,7 @@ def chunk_json(id_, content=None, role=None, finish_reason=None):
         "id": id_,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
-        "model": "jiuge",
+        "model": model_type,
         "system_fingerprint": None,
         "choices": [
             {
@@ -109,7 +119,13 @@ class AsyncInferTask(InferTask):
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    app.state.model = JiugeForCauslLM(model_path, device_type, ndev, max_tokens=max_tokens)
+    if model_type == "jiuge":
+        app.state.model = JiugeForCauslLM(model_path, device_type, ndev, max_tokens=max_tokens)
+    elif model_type == "tinymix":
+        app.state.model = TinyMixForCauslLM(model_path, device_type, ndev, max_tokens=max_tokens)
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+
     app.state.kv_cache_pool = KVCachePool(app.state.model, MAX_BATCH)
     app.state.request_queue = janus.Queue()
     worker_thread = threading.Thread(target=worker_loop, args=(app,), daemon=True)
@@ -284,7 +300,7 @@ if __name__ == "__main__":
 curl -N -H "Content-Type: application/json" \
      -X POST http://127.0.0.1:8000/chat/completions \
      -d '{
-       "model": "jiuge",
+       "model": "tinymix",
        "messages": [
          {"role": "user", "content": "山东最高的山是？"}
        ],

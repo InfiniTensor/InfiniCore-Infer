@@ -133,8 +133,12 @@ std::shared_ptr<Tensor> Tensor::buffer(infiniDtype_t dtype,
             strides[i] = strides[i + 1] * shape[i + 1];
         }
     }
+    
+	std::cerr << "[DEBUG] Tensor::buffer: size=" << size << ", pool valid? " << (pool ? "yes" : "no") << std::endl;
     tensor->_storage = Storage::createFromPool(size, pool);
+    std::cerr << "[DEBUG] Tensor::buffer: Storage created." << std::endl;
     tensor->_desc = TensorDesc::create(dtype, shape, strides);
+    std::cerr << "[DEBUG] Tensor::buffer: TensorDesc created." << std::endl;
     tensor->_offset = 0;
     return tensor;
 }

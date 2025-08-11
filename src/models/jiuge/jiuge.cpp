@@ -67,7 +67,8 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
     RUN_INFINI(infinirtDeviceSynchronize());
 }
 
-void releaseDeviceResource(DeviceResource &res) {
+// Define as static to limit scope to this file and prevent linker errors.
+static void releaseDeviceResource(DeviceResource &res) {
     infinirtDeviceSynchronize();
     // Release individual Tensors
     res.w_in_embd.reset();
