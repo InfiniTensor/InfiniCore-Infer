@@ -45,6 +45,7 @@ class KVCachePool:
         self._cache_metadata: Dict[int, CacheMetadata] = {}  # 缓存元数据
         self._prefix_index: Dict[str, List[int]] = defaultdict(list)  # 前缀索引
         self._lru_order: OrderedDict[int, bool] = OrderedDict()  # LRU顺序
+        self._in_use_caches: Dict[int, bool] = {}  # 跟踪正在使用的缓存
         self._next_cache_id = 0
         
         # 性能统计
@@ -54,69 +55,73 @@ class KVCachePool:
         self._lru_evictions = 0  # 跟踪LRU淘汰次数
 
     def _evict_lru_cache(self) -> bool:
-        """LRU淘汰策略：移除最少使用的缓存"""
+        """LRU淘汰策略：移除最少使用的缓存（仅淘汰未在使用的缓存）"""
         if not self._lru_order:
             return False
         
-        # 如果available列表为空，需要强制淘汰正在使用的缓存
+        # 如果available列表为空，不能进行淘汰
         if not self._available:
-            print("[WARNING] All caches are in use, forcing LRU eviction")
-            return self._force_evict_lru_cache()
+            print("[WARNING] All caches are in use, cannot evict. Waiting for cache release.")
+            return False
         
-        # 正常情况：从available列表中淘汰
+        # 只从available列表中淘汰未在使用的缓存
         return self._evict_from_available()
     
-    def _force_evict_lru_cache(self) -> bool:
-        """强制淘汰LRU缓存，即使它正在使用中"""
-        if not self._lru_order:
-            return False
-        
-        # 找到最少使用的缓存ID
-        lru_cache_id = next(iter(self._lru_order))
-        
-        # 清理元数据
-        if lru_cache_id in self._cache_metadata:
-            del self._cache_metadata[lru_cache_id]
-        if lru_cache_id in self._lru_order:
-            del self._lru_order[lru_cache_id]
-        
-        # 减少缓存计数
-        self.num_caches -= 1
-        self._lru_evictions += 1  # 增加LRU淘汰计数
-        return True
+
     
     def _evict_from_available(self) -> bool:
         """从available列表中淘汰LRU缓存"""
+        if not self._available:
+            return False
         
-        # 找到最少使用的缓存
-        lru_cache_id = next(iter(self._lru_order))
+        # 找到available列表中最少使用的缓存
+        lru_cache_id = None
+        lru_cache_index = -1
+        oldest_access_time = float('inf')
         
-        # 在available列表中找到对应的缓存
         for i, kvcache in enumerate(self._available):
-            if id(kvcache) == lru_cache_id:
-                # 移除缓存
-                evicted_cache = self._available.pop(i)
+            cache_id = id(kvcache)
+            # 跳过正在使用的缓存
+            if cache_id in self._in_use_caches:
+                continue
                 
-                # 从前缀索引中移除
-                self._remove_from_prefix_index(i, evicted_cache.tokens)
-                
-                # 更新其他缓存在前缀索引中的位置
-                for prefix_key, cache_indices in self._prefix_index.items():
-                    for j in range(len(cache_indices)):
-                        if cache_indices[j] > i:
-                            cache_indices[j] -= 1
-                
-                # 清理元数据
-                if lru_cache_id in self._cache_metadata:
-                    del self._cache_metadata[lru_cache_id]
-                if lru_cache_id in self._lru_order:
-                    del self._lru_order[lru_cache_id]
-                
-                # 释放底层资源
-                evicted_cache.drop(self.model)
-                self.num_caches -= 1
-                self._lru_evictions += 1  # 增加LRU淘汰计数
-                return True
+            if cache_id in self._cache_metadata:
+                metadata = self._cache_metadata[cache_id]
+                if metadata.last_access_time < oldest_access_time:
+                    oldest_access_time = metadata.last_access_time
+                    lru_cache_id = cache_id
+                    lru_cache_index = i
+            else:
+                # 如果没有元数据，优先淘汰这个缓存
+                lru_cache_id = cache_id
+                lru_cache_index = i
+                break
+        
+        if lru_cache_index >= 0:
+            # 移除缓存
+            evicted_cache = self._available.pop(lru_cache_index)
+            
+            # 从前缀索引中移除
+            self._remove_from_prefix_index(lru_cache_index, evicted_cache.tokens)
+            
+            # 更新其他缓存在前缀索引中的位置
+            for prefix_key, cache_indices in self._prefix_index.items():
+                for j in range(len(cache_indices)):
+                    if cache_indices[j] > lru_cache_index:
+                        cache_indices[j] -= 1
+            
+            # 清理元数据
+            if lru_cache_id in self._cache_metadata:
+                del self._cache_metadata[lru_cache_id]
+            if lru_cache_id in self._lru_order:
+                del self._lru_order[lru_cache_id]
+            
+            # 释放底层资源
+            evicted_cache.drop(self.model)
+            self.num_caches -= 1
+            self._lru_evictions += 1  # 增加LRU淘汰计数
+            print(f"[INFO] Evicted cache {lru_cache_id} from available pool")
+            return True
         
         return False
     
@@ -137,8 +142,9 @@ class KVCachePool:
                         # 创建元数据
                         self._cache_metadata[cache_id] = CacheMetadata(cache_id)
                         self._lru_order[cache_id] = True
+                        # 标记为正在使用
+                        self._in_use_caches[cache_id] = True
                         
-
                         return infer_task.bind_kvcache(new_cache, 0)
                     else:
                         # 尝试LRU淘汰
@@ -161,7 +167,10 @@ class KVCachePool:
                             if cache_indices[j] > max_match_index:
                                 cache_indices[j] -= 1
                     
-
+                    # 标记为正在使用
+                    cache_id = id(kvcache)
+                    self._in_use_caches[cache_id] = True
+                    
                     return infer_task.bind_kvcache(kvcache, max_match)
 
     def release_sync(self, infer_task):
@@ -184,6 +193,10 @@ class KVCachePool:
             if cache_id in self._lru_order:
                 del self._lru_order[cache_id]
             self._lru_order[cache_id] = True
+            
+            # 移除正在使用的标记
+            if cache_id in self._in_use_caches:
+                del self._in_use_caches[cache_id]
 
             self._not_empty.notify()
 
@@ -351,6 +364,7 @@ class KVCachePool:
             self._cache_metadata.clear()
             self._prefix_index.clear()
             self._lru_order.clear()
+            self._in_use_caches.clear()
             
             self.max_caches = 0
             self.num_caches = 0
