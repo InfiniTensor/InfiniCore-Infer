@@ -2,6 +2,7 @@ from jiuge import JiugeForCauslLM
 from libinfinicore_infer import DeviceType
 from infer_task import InferTask
 from kvcache_pool import KVCachePool
+from dynamic_batch_manager import DynamicBatchManager
 
 import argparse
 import queue
@@ -14,6 +15,9 @@ import uuid
 import json
 import threading
 import janus
+import torch
+import pynvml
+import psutil
 
 
 DEVICE_TYPE_MAP = {
@@ -48,7 +52,7 @@ def parse_args():
     parser.add_argument(
         "--max-batch",
         type=int,
-        default=3,
+        default=4,
         help="Maximum number of requests that can be batched together (default: 3)",
     )
     parser.add_argument(
@@ -105,6 +109,35 @@ class AsyncInferTask(InferTask):
         self.next(out_token)
         self.output_queue.sync_q.put(out_token)
 
+def get_memory_usage() -> float:
+    """获取当前GPU显存使用率，如果GPU不可用则获取系统内存使用率"""
+    try:
+        # 检查是否有可用的GPU
+        if pynvml and hasattr(pynvml, 'nvmlInit'):
+            try:
+                pynvml.nvmlInit()
+                # 使用第一个GPU设备
+                gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                
+                # 清理PyTorch缓存以获得准确的显存使用率
+                if torch and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # 获取GPU显存使用率
+                memory_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
+                gpu_usage = memory_info.used / memory_info.total
+                return gpu_usage
+            except Exception as e:
+                print(f"[WARNING] Failed to get GPU memory usage: {e}")
+        
+        # 回退到系统内存使用率
+        memory = psutil.virtual_memory()
+        return memory.percent / 100.0
+        
+    except Exception as e:
+        print(f"[WARNING] Failed to get memory usage: {e}")
+        return 0.5  # 默认返回50%
+
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -112,6 +145,17 @@ async def lifespan(app: FastAPI):
     app.state.model = JiugeForCauslLM(model_path, device_type, ndev, max_tokens=max_tokens)
     app.state.kv_cache_pool = KVCachePool(app.state.model, MAX_BATCH)
     app.state.request_queue = janus.Queue()
+    initial_mem_usage = get_memory_usage()
+    print(f'[Info] initial memory usage: {initial_mem_usage}')
+    # 初始化动态批处理管理器
+    app.state.batch_manager = DynamicBatchManager(
+        min_batch_size=1,
+        max_batch_size=MAX_BATCH,
+        max_wait_time_ms=200,  # 增加等待时间以允许更大的批次
+        memory_threshold=0.9,  # 调整内存阈值到90%，避免过早触发内存压力保护
+        base_mem_usage=initial_mem_usage,
+        gpu_device_id=0  # 使用第一个GPU设备
+    )
     worker_thread = threading.Thread(target=worker_loop, args=(app,), daemon=True)
     worker_thread.start()
 
@@ -130,33 +174,134 @@ async def lifespan(app: FastAPI):
 App = FastAPI(lifespan=lifespan)
 
 
+@App.get("/batch_stats")
+async def get_batch_stats():
+    """获取动态批处理统计信息"""
+    try:
+        stats = App.state.batch_manager.get_stats()
+        return JSONResponse(content={
+            "status": "success",
+            "data": stats
+        })
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
+
 # App loop: take requests from the queue, do inference, and put unfinished requests back into the queue.
 def worker_loop(app):
+    """动态批处理工作循环"""
+    batch_manager = app.state.batch_manager
+    
     while True:
         try:
-            task = app.state.request_queue.sync_q.get(timeout=0.01)
+            # 尝试获取第一个任务
+            task = app.state.request_queue.sync_q.get(timeout=0.05)
         except queue.Empty:
             continue
 
         if task is None:
             return
 
+        # 开始构建批次
         batch = [task]
-        while len(batch) < MAX_BATCH:
-            try:
-                req = app.state.request_queue.sync_q.get_nowait()
-                if req is not None:
-                    batch.append(req)
-            except queue.Empty:
+        batch_start_time = time.time()
+        
+        while True:
+            current_time = time.time()
+            wait_time_ms = (current_time - batch_start_time) * 1000
+            queue_size = app.state.request_queue.sync_q.qsize()
+            
+            # 获取动态批处理建议
+            suggested_batch_size = batch_manager.calculate_dynamic_batch_size(
+                queue_size + len(batch), wait_time_ms
+            )
+            
+            # 判断是否应该处理当前批次
+            should_process = batch_manager.should_process_batch(
+                len(batch), queue_size, wait_time_ms
+            )
+            
+            if should_process:
                 break
-        output_tokens = app.state.model.batch_infer_one_round(batch)
-        for task, token in zip(batch, output_tokens):
-            task.output(token)
-            if task.finish_reason is None:
-                app.state.request_queue.sync_q.put(task)
+            
+            # 尝试添加更多任务到批次
+            if len(batch) < suggested_batch_size:
+                try:
+                    # 计算剩余等待时间，确保有足够时间收集更多请求
+                    remaining_wait_ms = max(0, batch_manager.current_wait_time_ms - wait_time_ms)
+                    timeout_seconds = min(0.05, remaining_wait_ms / 1000.0)  # 最多等待50ms
+                    req = app.state.request_queue.sync_q.get(timeout=timeout_seconds)
+                    if req is not None:
+                        batch.append(req)
+                    else:
+                        break
+                except queue.Empty:
+                    # 检查是否应该继续等待
+                    if wait_time_ms >= batch_manager.current_wait_time_ms:
+                        break
+                    time.sleep(0.001)  # 短暂等待
             else:
-                print(f"[INFO] Task {task.id} finished infer.")
-                app.state.kv_cache_pool.release_sync(task)
+                break
+        
+        # 执行批量推理
+        if len(batch) > 0:
+            print(f"[DEBUG] Processing batch with size: {len(batch)}, suggested size was: {suggested_batch_size}")
+            infer_start_time = time.time()
+            
+            try:
+                output_tokens = app.state.model.batch_infer_one_round(batch)
+                
+                # 处理输出
+                finished_tasks = 0
+                for task, token in zip(batch, output_tokens):
+                    task.output(token)
+                    if task.finish_reason is None:
+                        app.state.request_queue.sync_q.put(task)
+                    else:
+                        print(f"[INFO] Task {task.id} finished infer.")
+                        app.state.kv_cache_pool.release_sync(task)
+                        finished_tasks += 1
+                
+                # 如果有任务完成，检查是否需要清理显存
+                if finished_tasks > 0:
+                    current_memory = batch_manager.get_memory_usage()
+                    if current_memory > 0.75:  # 显存占用超过75%时主动清理
+                        print(f"[INFO] Memory usage before cleanup: {current_memory:.2%}")
+                        batch_manager._force_memory_cleanup()
+                        # 清理后再次检查显存使用率
+                        new_memory = batch_manager.get_memory_usage()
+                        print(f"[INFO] Memory usage after cleanup: {new_memory:.2%}, freed: {(current_memory-new_memory)*100:.2f}%")
+                    elif finished_tasks >= 3:  # 每完成3个任务就强制清理一次
+                        print(f"[INFO] Periodic cleanup after {finished_tasks} tasks, memory usage: {current_memory:.2%}")
+                        batch_manager._force_memory_cleanup()
+                
+                # 记录性能数据
+                infer_end_time = time.time()
+                latency_ms = (infer_end_time - infer_start_time) * 1000
+                throughput = len(batch) / (infer_end_time - infer_start_time)
+                
+                batch_manager.record_batch_performance(
+                    len(batch), latency_ms, throughput
+                )
+                
+                # 定期打印统计信息
+                if len(batch_manager.batch_history) % 50 == 0:
+                    stats = batch_manager.get_stats()
+                    print(f"[INFO] Dynamic Batch Stats: optimal_batch={stats['current_optimal_batch']}, "
+                          f"wait_time={stats['current_wait_time_ms']}ms, "
+                          f"memory_usage={stats['memory_usage']:.4%}, "
+                          f"avg_latency={stats['avg_latency']:.1f}ms, "
+                          f"avg_throughput={stats['avg_throughput']:.1f} req/s")
+                
+            except Exception as e:
+                print(f"[ERROR] Batch inference failed: {e}")
+                # 将任务重新放回队列
+                for task in batch:
+                    if task.finish_reason is None:
+                        app.state.request_queue.sync_q.put(task)
 
 
 def build_task(id_, request_data, request: Request):
@@ -278,7 +423,7 @@ async def chat_completions(request: Request):
         return JSONResponse(content=response)
 
 if __name__ == "__main__":
-    uvicorn.run(App, host="0.0.0.0", port=8000)
+    uvicorn.run(App, host="0.0.0.0", port=8010)
 
 """
 curl -N -H "Content-Type: application/json" \
