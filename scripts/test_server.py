@@ -3,7 +3,7 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-API_URL = "http://localhost:8000/chat/completions"
+API_URL = "http://localhost:8010/chat/completions"
 MODEL = "FM9G-7B"
 PROMPT = ["山东最高的山是？", "给我讲个故事"]
 CONCURRENCY = 10  # 并发用户数量

@@ -13,7 +13,7 @@ import time
 from typing import Iterator, Tuple, Dict
 
 class ChatClient:
-    def __init__(self, server_url: str = "http://127.0.0.1:8000"):
+    def __init__(self, server_url: str = "http://127.0.0.1:8010"):
         self.server_url = server_url
         self.chat_endpoint = f"{server_url}/chat/completions"
     
