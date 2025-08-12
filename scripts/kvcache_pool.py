@@ -197,6 +197,14 @@ class KVCachePool:
             # 移除正在使用的标记
             if cache_id in self._in_use_caches:
                 del self._in_use_caches[cache_id]
+            
+            # 释放缓存后清理GPU显存碎片
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass  # torch不可用时跳过
 
             self._not_empty.notify()
 
