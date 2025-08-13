@@ -16,8 +16,43 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
+class DynamicBatchConfig:
+    """动态批处理配置常量"""
+    # 显存状态阈值
+    MEMORY_THRESHOLDS = {
+        'low': 0.25,
+        'medium': 0.35,
+        'high': 0.60
+    }
+    
+    # 探索概率配置
+    EXPLORATION_PROBABILITIES = {
+        'low_memory_larger': 1.0,
+        'low_memory_smaller': 0.2,
+        'medium_memory_larger': 0.7,
+        'medium_memory_smaller': 0.3,
+        'high_memory_larger': 0.1,
+        'high_memory_smaller': 1.0
+    }
+    
+    # 评分权重配置
+    SCORING_WEIGHTS = {
+        'confidence_bonus_max': 0.1,
+        'batch_bonus_low_memory': 0.2,
+        'batch_bonus_medium_memory': 0.1,
+        'batch_bonus_high_memory': 0.05
+    }
+    
+    # 调整阈值
+    ADJUSTMENT_THRESHOLDS = {
+        'min_samples_required': 3,
+        'score_improvement_threshold': 0.05,
+        'recent_samples_keep': 20
+    }
+
+
 class DynamicBatchManager:
-    """动态批处理管理器 - 修复版本"""
+    """动态批处理管理器 - 优化版本"""
     
     def __init__(self, min_batch_size=1, max_batch_size=8, max_wait_time_ms=200, 
                  memory_threshold=0.8, adaptive_window=50, base_mem_usage=0.5, gpu_device_id=0):
@@ -232,15 +267,21 @@ class DynamicBatchManager:
             if len(self.batch_history) >= 10:
                 self._adaptive_adjustment()
     
-    def _adaptive_adjustment(self):
-        """基于历史性能数据进行自适应调整 - 修复版本"""
-        if len(self.batch_history) < 5:
-            return
-        
-        # 优先使用持久化的性能数据进行评估
+    def _get_memory_state(self) -> str:
+        """获取显存状态分类"""
+        usage = self.get_memory_usage()
+        if usage < DynamicBatchConfig.MEMORY_THRESHOLDS['low']:
+            return 'low'
+        elif usage < DynamicBatchConfig.MEMORY_THRESHOLDS['medium']:
+            return 'medium'
+        else:
+            return 'high'
+    
+    def _collect_performance_data(self) -> dict:
+        """收集性能数据"""
         batch_performance = {}
         
-        # 首先从持久化数据中获取性能信息
+        # 从持久化数据中获取性能信息
         for batch_size, perf_data in self.persistent_batch_performance.items():
             if len(perf_data['latencies']) > 0:
                 batch_performance[batch_size] = {
@@ -257,143 +298,126 @@ class DynamicBatchManager:
                 batch_performance[batch_size]['latencies'].append(self.latency_history[i])
                 batch_performance[batch_size]['throughputs'].append(self.throughput_history[i])
         
-        # 样本数量平衡：确保每个批次大小至少有3个样本才参与评估
-        min_samples_required = 3
-        valid_batch_sizes = [bs for bs, perf in batch_performance.items() 
-                           if len(perf['latencies']) >= min_samples_required]
+        return batch_performance
+    
+    def _filter_valid_batches(self, batch_performance: dict) -> dict:
+        """过滤有效的批次数据"""
+        min_samples = DynamicBatchConfig.ADJUSTMENT_THRESHOLDS['min_samples_required']
+        return {bs: perf for bs, perf in batch_performance.items() 
+                if len(perf['latencies']) >= min_samples}
+    
+    def _handle_insufficient_data(self):
+        """处理数据不足的情况"""
+        print(f"[DEBUG] Insufficient valid batch sizes for comparison")
+        if len(self.batch_history) > 30:
+            # 保留最近的样本
+            recent_count = DynamicBatchConfig.ADJUSTMENT_THRESHOLDS['recent_samples_keep']
+            self.batch_history = deque(list(self.batch_history)[-recent_count:], maxlen=self.adaptive_window)
+            self.latency_history = deque(list(self.latency_history)[-recent_count:], maxlen=self.adaptive_window)
+            self.throughput_history = deque(list(self.throughput_history)[-recent_count:], maxlen=self.adaptive_window)
+            print(f"[INFO] Cleared old performance data, keeping recent {recent_count} samples")
+    
+    def _explore_new_batch_size(self, current_size: int):
+        """探索新的批次大小"""
+        memory_state = self._get_memory_state()
+        config = DynamicBatchConfig.EXPLORATION_PROBABILITIES
         
-        if len(valid_batch_sizes) < 2:
-            print(f"[DEBUG] Insufficient valid batch sizes for comparison: {len(valid_batch_sizes)}")
-            # 如果样本不足，保持当前设置但清理部分历史数据以促进新的探索
-            if len(self.batch_history) > 30:
-                # 保留最近的20个样本
-                recent_count = 20
-                self.batch_history = deque(list(self.batch_history)[-recent_count:], maxlen=self.adaptive_window)
-                self.latency_history = deque(list(self.latency_history)[-recent_count:], maxlen=self.adaptive_window)
-                self.throughput_history = deque(list(self.throughput_history)[-recent_count:], maxlen=self.adaptive_window)
-                print(f"[INFO] Cleared old performance data, keeping recent {recent_count} samples")
-            return
+        import random
         
-        # 改进的探索机制：基于显存状态的智能探索策略
-        print(f"[DEBUG] Current batch_performance keys: {list(batch_performance.keys())}")
-        if len(batch_performance) == 1:
-            current_size = list(batch_performance.keys())[0]
-            print(f"[DEBUG] Only one batch size in performance data: {current_size}")
-            
-            # 获取当前显存状态
-            memory_usage = self.get_memory_usage()
-            base_memory_usage = 0.60  # 基础显存占用
-            dynamic_usage = max(0, memory_usage - base_memory_usage)
-            
-            # 根据显存状态决定探索方向
-            if dynamic_usage < 0.25:  # 动态显存占用较低（<25%），优先探索更大批次
-                if current_size < self.max_batch_size:
-                    self.current_optimal_batch = min(self.max_batch_size, current_size + 1)
-                    print(f"[INFO] Low memory usage ({dynamic_usage:.2%}), exploring larger batch size -> {self.current_optimal_batch}")
-                    return
-                elif current_size > self.min_batch_size:  # 已达到最大批次，偶尔尝试更小批次进行对比
-                    import random
-                    if random.random() < 0.2:  # 20%概率尝试更小批次
-                        self.current_optimal_batch = max(self.min_batch_size, current_size - 1)
-                        print(f"[INFO] At max batch, occasionally trying smaller batch size -> {self.current_optimal_batch}")
-                        return
-            elif dynamic_usage < 0.35:  # 中等动态显存占用（25%-35%），平衡探索
-                import random
-                if random.random() < 0.7:  # 70%概率尝试更大批次
-                    if current_size < self.max_batch_size:
-                        self.current_optimal_batch = min(self.max_batch_size, current_size + 1)
-                        print(f"[INFO] Medium memory usage ({dynamic_usage:.2%}), exploring larger batch size -> {self.current_optimal_batch}")
-                        return
-                else:  # 30%概率尝试更小批次
-                    if current_size > self.min_batch_size:
-                        self.current_optimal_batch = max(self.min_batch_size, current_size - 1)
-                        print(f"[INFO] Medium memory usage ({dynamic_usage:.2%}), exploring smaller batch size -> {self.current_optimal_batch}")
-                        return
-            else:  # 高动态显存占用（>35%），优先探索更小批次
-                if current_size > self.min_batch_size:
-                    self.current_optimal_batch = max(self.min_batch_size, current_size - 1)
-                    print(f"[INFO] High memory usage ({dynamic_usage:.2%}), exploring smaller batch size -> {self.current_optimal_batch}")
-                    return
-                elif current_size < self.max_batch_size:  # 已达到最小批次，偶尔尝试更大批次
-                    import random
-                    if random.random() < 0.1:  # 10%概率尝试更大批次
-                        self.current_optimal_batch = min(self.max_batch_size, current_size + 1)
-                        print(f"[INFO] At min batch, occasionally trying larger batch size -> {self.current_optimal_batch}")
-                        return
+        if memory_state == 'low':
+            # 低显存压力，优先探索更大批次
+            if current_size < self.max_batch_size and random.random() < config['low_memory_larger']:
+                self.current_optimal_batch = min(self.max_batch_size, current_size + 1)
+                print(f"[INFO] Low memory usage, exploring larger batch size -> {self.current_optimal_batch}")
+            elif current_size > self.min_batch_size and random.random() < config['low_memory_smaller']:
+                self.current_optimal_batch = max(self.min_batch_size, current_size - 1)
+                print(f"[INFO] At max batch, trying smaller batch size -> {self.current_optimal_batch}")
         
-        # 改进的评分算法：样本数量平衡的权重分配
+        elif memory_state == 'medium':
+            # 中等显存压力，平衡探索
+            if current_size < self.max_batch_size and random.random() < config['medium_memory_larger']:
+                self.current_optimal_batch = min(self.max_batch_size, current_size + 1)
+                print(f"[INFO] Medium memory usage, exploring larger batch size -> {self.current_optimal_batch}")
+            elif current_size > self.min_batch_size and random.random() < config['medium_memory_smaller']:
+                self.current_optimal_batch = max(self.min_batch_size, current_size - 1)
+                print(f"[INFO] Medium memory usage, exploring smaller batch size -> {self.current_optimal_batch}")
+        
+        else:  # high memory state
+            # 高显存压力，优先探索更小批次
+            if current_size > self.min_batch_size and random.random() < config['high_memory_smaller']:
+                self.current_optimal_batch = max(self.min_batch_size, current_size - 1)
+                print(f"[INFO] High memory usage, exploring smaller batch size -> {self.current_optimal_batch}")
+            elif current_size < self.max_batch_size and random.random() < config['high_memory_larger']:
+                self.current_optimal_batch = min(self.max_batch_size, current_size + 1)
+                print(f"[INFO] At min batch, trying larger batch size -> {self.current_optimal_batch}")
+    
+    def _get_confidence_bonus(self, sample_count: int) -> float:
+        """计算置信度奖励"""
+        import math
+        sample_weight = math.log(sample_count + 1) / math.log(10 + 1)
+        return sample_weight * DynamicBatchConfig.SCORING_WEIGHTS['confidence_bonus_max']
+    
+    def _get_batch_bonus(self, batch_size: int, memory_state: str) -> float:
+        """计算批次大小奖励"""
+        weights = DynamicBatchConfig.SCORING_WEIGHTS
+        
+        if memory_state == 'low':
+            return batch_size * weights['batch_bonus_low_memory']
+        elif memory_state == 'medium':
+            return batch_size * weights['batch_bonus_medium_memory']
+        else:  # high
+            return (self.max_batch_size - batch_size + 1) * weights['batch_bonus_high_memory']
+    
+    def _calculate_batch_score(self, batch_size: int, performance: dict, memory_state: str) -> float:
+        """计算批次评分"""
+        avg_latency = sum(performance['latencies']) / len(performance['latencies'])
+        avg_throughput = sum(performance['throughputs']) / len(performance['throughputs'])
+        sample_count = len(performance['latencies'])
+        
+        # 基础效率评分
+        efficiency = avg_throughput / (1 + avg_latency / 50)
+        
+        # 置信度奖励
+        confidence_bonus = self._get_confidence_bonus(sample_count)
+        
+        # 批次大小奖励
+        batch_bonus = self._get_batch_bonus(batch_size, memory_state)
+        
+        # 综合评分
+        score = efficiency + batch_bonus + confidence_bonus
+        
+        print(f"[DEBUG] Batch {batch_size}: efficiency={efficiency:.2f}, batch_bonus={batch_bonus:.2f}, confidence_bonus={confidence_bonus:.2f}, samples={sample_count}, total_score={score:.2f}")
+        
+        return score
+    
+    def _optimize_batch_size(self, valid_batches: dict):
+        """优化批次大小"""
+        memory_state = self._get_memory_state()
         best_score = -1
         best_batch_size = self.current_optimal_batch
         
-        # 只评估有效的批次大小
-        filtered_performance = {bs: perf for bs, perf in batch_performance.items() if bs in valid_batch_sizes}
-        print(f"[DEBUG] Evaluating valid batch performance data: {[(k, len(v['latencies'])) for k, v in filtered_performance.items()]}")
+        print(f"[DEBUG] Evaluating valid batch performance data: {[(k, len(v['latencies'])) for k, v in valid_batches.items()]}")
         
-        for batch_size, perf in filtered_performance.items():
-            avg_latency = sum(perf['latencies']) / len(perf['latencies'])
-            avg_throughput = sum(perf['throughputs']) / len(perf['throughputs'])
-            sample_count = len(perf['latencies'])
-            
-            # 改进的评分公式：基于显存状态的动态评分 + 样本数量权重
-            # 获取当前显存状态
-            memory_usage = self.get_memory_usage()
-            base_memory_usage = 0.60  # 基础显存占用
-            dynamic_usage = max(0, memory_usage - base_memory_usage)
-            
-            # 基础效率评分
-            efficiency = avg_throughput / (1 + avg_latency / 50)  # 归一化延迟影响
-            
-            # 样本数量权重：样本越多，置信度越高，但避免过度偏向
-            # 使用对数函数避免样本数量差异过大时的不公平比较
-            import math
-            sample_weight = math.log(sample_count + 1) / math.log(10 + 1)  # 归一化到[0,1]区间
-            confidence_bonus = sample_weight * 0.1  # 最多10%的置信度奖励
-            
-            # 根据显存状态调整批次大小奖励
-            if dynamic_usage < 0.25:  # 显存充足，大批次获得更多奖励
-                batch_bonus = batch_size * 0.2  # 适度的大批次奖励
-            elif dynamic_usage < 0.35:  # 中等显存压力，适中奖励
-                batch_bonus = batch_size * 0.1
-            else:  # 高显存压力，小批次获得奖励
-                batch_bonus = (self.max_batch_size - batch_size + 1) * 0.05  # 小批次获得奖励
-            
-            # 综合评分：效率 + 批次奖励 + 置信度奖励
-            score = efficiency + batch_bonus + confidence_bonus
-            
-            print(f"[DEBUG] Batch {batch_size}: efficiency={efficiency:.2f}, batch_bonus={batch_bonus:.2f}, confidence_bonus={confidence_bonus:.2f}, samples={sample_count}, total_score={score:.2f}")
+        # 计算所有有效批次的评分
+        for batch_size, performance in valid_batches.items():
+            score = self._calculate_batch_score(batch_size, performance, memory_state)
             
             if score > best_score:
                 best_score = score
                 best_batch_size = batch_size
         
-        # 稳定的调整策略：防止频繁变化
+        # 稳定的调整策略：只有显著改善才调整
         if best_batch_size != self.current_optimal_batch:
-            # 计算评分差异，只有显著差异才调整
-            current_batch_score = -1
-            for batch_size, perf in filtered_performance.items():
-                if batch_size == self.current_optimal_batch:
-                    avg_latency = sum(perf['latencies']) / len(perf['latencies'])
-                    avg_throughput = sum(perf['throughputs']) / len(perf['throughputs'])
-                    sample_count = len(perf['latencies'])
-                    
-                    efficiency = avg_throughput / (1 + avg_latency / 50)
-                    import math
-                    sample_weight = math.log(sample_count + 1) / math.log(10 + 1)
-                    confidence_bonus = sample_weight * 0.1
-                    
-                    if dynamic_usage < 0.25:
-                        batch_bonus = batch_size * 0.2
-                    elif dynamic_usage < 0.35:
-                        batch_bonus = batch_size * 0.1
-                    else:
-                        batch_bonus = (self.max_batch_size - batch_size + 1) * 0.05
-                    
-                    current_batch_score = efficiency + batch_bonus + confidence_bonus
-                    break
+            current_score = self._calculate_batch_score(
+                self.current_optimal_batch, 
+                valid_batches.get(self.current_optimal_batch, {'latencies': [100], 'throughputs': [1]}),
+                memory_state
+            )
             
-            # 只有新的最佳批次显著优于当前批次时才调整（至少5%的提升）
-            score_improvement = (best_score - current_batch_score) / max(current_batch_score, 0.1)
-            if score_improvement > 0.05:  # 5%的显著提升阈值
+            score_improvement = (best_score - current_score) / max(current_score, 0.1)
+            threshold = DynamicBatchConfig.ADJUSTMENT_THRESHOLDS['score_improvement_threshold']
+            
+            if score_improvement > threshold:
                 # 渐进式调整：每次最多调整1个单位
                 diff = best_batch_size - self.current_optimal_batch
                 adjustment = 1 if diff > 0 else -1 if diff < 0 else 0
@@ -405,8 +429,9 @@ class DynamicBatchManager:
                 print(f"[INFO] Significant improvement detected ({score_improvement:.1%}): optimal batch size -> {self.current_optimal_batch}")
             else:
                 print(f"[DEBUG] Score improvement insufficient ({score_improvement:.1%}), keeping current optimal batch: {self.current_optimal_batch}")
-        
-        # 调整等待时间
+    
+    def _adjust_wait_time(self):
+        """调整等待时间"""
         if len(self.latency_history) >= 10:
             avg_latency = sum(list(self.latency_history)[-10:]) / 10
             if avg_latency > 100:  # 延迟过高，减少等待时间
@@ -414,6 +439,25 @@ class DynamicBatchManager:
             elif avg_latency < 50:  # 延迟较低，可以增加等待时间以获得更大批次
                 self.current_wait_time_ms = min(self.max_wait_time_ms, 
                                               self.current_wait_time_ms + 5)
+    
+    def _adaptive_adjustment(self):
+        """基于历史性能数据进行自适应调整 - 优化版本"""
+        if len(self.batch_history) < 5:
+            return
+        
+        batch_performance = self._collect_performance_data()
+        valid_batches = self._filter_valid_batches(batch_performance)
+        
+        if len(valid_batches) < 2:
+            self._handle_insufficient_data()
+            return
+        
+        if len(valid_batches) == 1:
+            self._explore_new_batch_size(list(valid_batches.keys())[0])
+            return
+        
+        self._optimize_batch_size(valid_batches)
+        self._adjust_wait_time()
     
     def get_stats(self) -> dict:
         """获取当前统计信息"""
