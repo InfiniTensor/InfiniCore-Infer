@@ -32,7 +32,8 @@ class CacheMetadata:
 
 
 class KVCachePool:
-    def __init__(self, model, max_caches: int = 32):
+    def __init__(self, model, max_caches: int = 8):
+        print(f"[INFO] KVCachePool init with max_caches: {max_caches}")
         self.max_caches = max_caches
         self.model = model
         self._available: List[KVCache] = []
@@ -53,6 +54,8 @@ class KVCachePool:
         self._cache_hits = 0
         self._exact_matches = 0
         self._lru_evictions = 0  # 跟踪LRU淘汰次数
+
+        print(f"[INFO] KVCachePool init done.")
 
     def _evict_lru_cache(self) -> bool:
         """LRU淘汰策略：移除最少使用的缓存（仅淘汰未在使用的缓存）"""

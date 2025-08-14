@@ -18,6 +18,7 @@ import janus
 import torch
 import pynvml
 import psutil
+import gc
 
 
 DEVICE_TYPE_MAP = {
@@ -139,18 +140,120 @@ def get_memory_usage() -> float:
         return 0.5  # 默认返回50%
 
 
+def get_gpu_memory_info():
+    """获取GPU显存信息（总量和已使用量，单位：字节）"""
+    try:
+        if pynvml and hasattr(pynvml, 'nvmlInit'):
+            pynvml.nvmlInit()
+            gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            
+            # 清理缓存以获得准确的显存使用情况
+            if torch and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+            
+            memory_info = pynvml.nvmlDeviceGetMemoryInfo(gpu_handle)
+            return memory_info.total, memory_info.used, memory_info.free
+    except Exception as e:
+        print(f"[WARNING] Failed to get GPU memory info: {e}")
+        return None, None, None
+
+
+def calculate_kvcache_memory_size(model):
+    """计算单个KVCache的显存占用（字节）"""
+    try:
+        # 获取模型元数据
+        meta = model.meta
+        ndev = model.ndev
+        
+        # KVCache参数
+        nlayer = meta.nlayer  # 层数
+        nkvh = meta.nkvh // ndev  # 每个设备的KV头数
+        max_len = meta.dctx  # 最大序列长度
+        dh = meta.dh  # 头维度
+        
+        # 数据类型大小（字节）
+        if meta.dt_logits == 0:  # INFINI_DTYPE_F16
+            dtype_size = 2
+        elif meta.dt_logits == 1:  # INFINI_DTYPE_F32
+            dtype_size = 4
+        elif meta.dt_logits == 2:  # INFINI_DTYPE_BF16
+            dtype_size = 2
+        else:
+            dtype_size = 2  # 默认使用F16
+        
+        # 单个KVCache的显存占用计算
+        # 每层有K和V两个缓存，形状为 [max_len, nkvh, dh]
+        single_cache_size = max_len * nkvh * dh * dtype_size
+        total_cache_size = single_cache_size * 2 * nlayer * ndev  # K和V，所有层，所有设备
+        
+        print(f"[INFO] KVCache参数: nlayer={nlayer}, nkvh={nkvh}, max_len={max_len}, dh={dh}, dtype_size={dtype_size}")
+        print(f"[INFO] 单个KVCache显存占用: {total_cache_size / (1024**3):.2f} GB")
+        
+        return total_cache_size
+    except Exception as e:
+        print(f"[ERROR] Failed to calculate KVCache memory size: {e}")
+        return None
+
+
+def estimate_max_concurrent_tasks(model, safety_margin=0.1):
+    """估算剩余显存最多能支持多少个任务同时创建KVCache"""
+    try:
+        # 获取GPU显存信息
+        total_memory, used_memory, free_memory = get_gpu_memory_info()
+        if total_memory is None:
+            print(f"[WARNING] Cannot get GPU memory info, using default estimation")
+            return MAX_BATCH
+        
+        # 计算单个KVCache的显存占用
+        single_kvcache_size = calculate_kvcache_memory_size(model)
+        if single_kvcache_size is None:
+            print(f"[WARNING] Cannot calculate KVCache size, using default estimation")
+            return MAX_BATCH
+        
+        # 计算可用显存（保留安全边际）
+        # available_memory = free_memory * (1 - safety_margin)
+        available_memory = free_memory
+        
+        # 估算最大并发任务数
+        max_tasks = int(available_memory // single_kvcache_size)
+        
+        print(f"[INFO] GPU显存信息:")
+        print(f"  - 总显存: {total_memory / (1024**3):.2f} GB")
+        print(f"  - 已使用: {used_memory / (1024**3):.2f} GB ({used_memory/total_memory*100:.1f}%)")
+        print(f"  - 剩余显存: {free_memory / (1024**3):.2f} GB")
+        print(f"  - 单个KVCache占用: {single_kvcache_size / (1024**3):.2f} GB")
+        print(f"  - 估算最大并发任务数: {max_tasks}")
+        
+        # 确保不超过配置的最大批次大小
+        recommended_tasks = min(max_tasks, MAX_BATCH)
+        return recommended_tasks
+        
+    except Exception as e:
+        print(f"[ERROR] Failed to estimate max concurrent tasks: {e}")
+        return MAX_BATCH
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     app.state.model = JiugeForCauslLM(model_path, device_type, ndev, max_tokens=max_tokens)
-    app.state.kv_cache_pool = KVCachePool(app.state.model, MAX_BATCH)
+    
+    # 模型加载完毕后，计算剩余显存最多能够支持几个任务同时创建KVCache
+    estimated_max_tasks = estimate_max_concurrent_tasks(app.state.model)
+    print(f"[INFO] 配置的MAX_BATCH: {MAX_BATCH}")
+    print(f"[INFO] 估算的最大并发任务数: {estimated_max_tasks}")
+    print('默认采用估算最大并发数')
+    
+    app.state.kv_cache_pool = KVCachePool(app.state.model, estimated_max_tasks)
+    # app.state.kv_cache_pool = KVCachePool(app.state.model)
     app.state.request_queue = janus.Queue()
     initial_mem_usage = get_memory_usage()
     print(f'[Info] initial memory usage: {initial_mem_usage}')
     # 初始化动态批处理管理器
     app.state.batch_manager = DynamicBatchManager(
         min_batch_size=1,
-        max_batch_size=MAX_BATCH,
+        max_batch_size=estimated_max_tasks,
         max_wait_time_ms=200,  # 增加等待时间以允许更大的批次
         memory_threshold=0.9,  # 调整内存阈值到90%，避免过早触发内存压力保护
         base_mem_usage=initial_mem_usage,
@@ -188,7 +291,6 @@ async def get_batch_stats():
             status_code=500,
             content={"status": "error", "message": str(e)}
         )
-
 
 # App loop: take requests from the queue, do inference, and put unfinished requests back into the queue.
 def worker_loop(app):
@@ -260,6 +362,7 @@ def worker_loop(app):
                 for task, token in zip(batch, output_tokens):
                     task.output(token)
                     if task.finish_reason is None:
+                        print(f"[DEBUG] Task {task.id} is not finished.")
                         app.state.request_queue.sync_q.put(task)
                     else:
                         print(f"[INFO] Task {task.id} finished infer.")
@@ -328,6 +431,7 @@ async def chat_stream(id_, request_data, request: Request):
     try:
         infer_task = build_task(id_, request_data, request)
         await request.app.state.kv_cache_pool.acquire(infer_task)
+        print(f"[INFO] Task {infer_task.id} acquired kv cache.")
 
         # Initial empty content
         chunk = json.dumps(

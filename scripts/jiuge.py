@@ -394,6 +394,8 @@ class JiugeForCauslLM:
     def __init__(
         self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None
     ):
+        # Store ndev as instance attribute for KVCache analysis
+        self.ndev = ndev
         def load_all_safetensors_from_dir(dir_path_: str):
             tensors_ = {}
             dir_path_ = Path(dir_path_)
