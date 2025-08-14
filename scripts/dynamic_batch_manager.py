@@ -24,6 +24,10 @@ class DynamicBatchConfig:
         'medium': 0.35,
         'high': 0.60
     }
+
+    TIMEOUT_THRESHOLDS = {
+        'max_waitime': 200,
+    }
     
     # 探索概率配置
     EXPLORATION_PROBABILITIES = {
@@ -154,7 +158,7 @@ class DynamicBatchManager:
         
         return self.memory_pressure
     
-    def calculate_dynamic_batch_size(self, queue_size: int, wait_time_ms: float) -> int:
+    def calculate_dynamic_batch_size(self, queue_size: int) -> int:
         """基于显存占用率计算动态批处理大小"""
         with self._lock:
             if queue_size == 0:
@@ -162,14 +166,11 @@ class DynamicBatchManager:
             
             # 获取当前显存占用率
             memory_usage = self.get_memory_usage()
-            
-            base_memory_usage = self.base_memory_usage
-            
             # 计算动态显存占用（KV缓存、临时tensor等）
             # dynamic_usage = max(0, memory_usage - base_memory_usage)
             
             # 根据动态显存使用率调整批次大小
-            if memory_usage > 0.90:  # 动态显存超过30%
+            if memory_usage > 0.97: 
                 # 高动态显存压力：使用最小批次并强制清理显存
                 target_batch = self.min_batch_size
                 self._force_memory_cleanup()
@@ -196,53 +197,25 @@ class DynamicBatchManager:
             print(f"[DEBUG] calculate_dynamic_batch_size: target_batch={target_batch}, queue_size={queue_size}, final_batch_size={final_batch_size}")
             return final_batch_size
     
-    def should_process_batch(self, current_batch_size: int, queue_size: int, 
+    def should_process_batch(self, current_batch_size: int, suggested_batch_size: int, queue_size: int, 
                            wait_time_ms: float) -> bool:
-        """基于显存占用率判断是否应该处理当前批次"""
         if current_batch_size == 0:
+            print('[DEBUG] should_not_process_batch: current_batch_size == 0')
             return False
-        
-        # 获取当前显存占用率
-        memory_usage = self.get_memory_usage()
-        
-        # 达到最大批处理大小，立即处理
-        if current_batch_size >= self.max_batch_size:
-            print('[DEBUG] should_process_batch: current_batch_size >= self.max_batch_size')
+
+        if wait_time_ms >= DynamicBatchConfig.TIMEOUT_THRESHOLDS['max_waitime']:
+            print('[DEBUG] should_process_batch: time out')
             return True
         
-        base_memory_usage = self.base_memory_usage
-        # dynamic_usage = max(0, memory_usage - base_memory_usage)
-        
-        # 高动态显存压力下（>30%），有任务就立即处理
-        if base_memory_usage > 0.95 and current_batch_size >= self.min_batch_size:
-            print('[DEBUG] should_process_batch: base_memory_usage > 0.95 and current_batch_size >= self.min_batch_size')
+        if current_batch_size >= suggested_batch_size:
+            print('[DEBUG] should_process_batch: cur_batch_size >= suggested_batch_size')
             return True
         
-        # 中等动态显存压力下（25%-30%），达到一半最大批次就处理
-        if base_memory_usage > 0.85 and current_batch_size >= (self.max_batch_size // 2):
-            print('[DEBUG] should_process_batch: base_memory_usage > 0.85 and current_batch_size >= (self.max_batch_size // 2)')
+        if queue_size == 0:
+            print('[DEBUG] should_process_batch: queue_size == 0')
             return True
         
-        # 低动态显存压力下（<20%），尽量等待更大批次
-        if base_memory_usage < 0.85:
-            # 只有达到最大批次或队列已满才处理
-            if current_batch_size >= self.max_batch_size or queue_size == 0:
-                print('[DEBUG] should_process_batch: base_memory_usage < 0.85 and current_batch_size >= self.max_batch_size or queue_size == 0')
-                return True
-            print('[DEBUG] should_not_process_batch: base_memory_usage < 0.85 and current_batch_size < self.max_batch_size and queue_size > 0')
-            return False
-        
-        # 正常动态显存压力下（20%-25%），达到当前最优批次就处理
-        if current_batch_size >= self.current_optimal_batch:
-            print('[DEBUG] should_process_batch: current_batch_size >= self.current_optimal_batch')
-            return True
-        
-        # 队列为空且有任务，立即处理
-        if queue_size == 0 and current_batch_size > 0:
-            print('[DEBUG] should_process_batch: queue_size == 0 and current_batch_size > 0')
-            return True
-        
-        print('[DEBUG] should_not_process_batch: queue_size > 0 and current_batch_size == 0')
+        print('[DEBUG] should_not_process_batch')
         return False
     
     def record_batch_performance(self, batch_size: int, latency_ms: float, 

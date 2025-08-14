@@ -52,8 +52,8 @@ def parse_args():
     parser.add_argument(
         "--max-batch",
         type=int,
-        default=4,
-        help="Maximum number of requests that can be batched together (default: 3)",
+        default=5,
+        help="Maximum number of requests that can be batched together (default: 4)",
     )
     parser.add_argument(
         "--max-tokens",
@@ -210,18 +210,19 @@ def worker_loop(app):
         batch_start_time = time.time()
         
         while True:
-            current_time = time.time()
-            wait_time_ms = (current_time - batch_start_time) * 1000
+            
             queue_size = app.state.request_queue.sync_q.qsize()
             
             # 获取动态批处理建议
             suggested_batch_size = batch_manager.calculate_dynamic_batch_size(
-                queue_size + len(batch), wait_time_ms
+                queue_size + len(batch)
             )
-            
+
+            current_time = time.time()
+            wait_time_ms = (current_time - batch_start_time) * 1000
             # 判断是否应该处理当前批次
             should_process = batch_manager.should_process_batch(
-                len(batch), queue_size, wait_time_ms
+                len(batch),suggested_batch_size, queue_size, wait_time_ms
             )
             
             if should_process:
