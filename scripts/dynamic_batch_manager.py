@@ -69,7 +69,7 @@ class DynamicBatchManager:
         self.base_memory_usage = base_mem_usage
         
         # 当前最优参数
-        self.current_optimal_batch = min(4, max_batch_size)  # 从中等批次开始
+        self.current_optimal_batch = max_batch_size
         self.current_wait_time_ms = max_wait_time_ms
         
         # 性能历史数据
@@ -170,22 +170,10 @@ class DynamicBatchManager:
             # dynamic_usage = max(0, memory_usage - base_memory_usage)
             
             # 根据动态显存使用率调整批次大小
-            if memory_usage > 0.97: 
-                # 高动态显存压力：使用最小批次并强制清理显存
-                target_batch = self.min_batch_size
-                self._force_memory_cleanup()
-                print(f"[WARNING] High dynamic memory usage {memory_usage:.2%}, using min batch size: {target_batch}, forced cleanup")
-            elif memory_usage > 0.80:  # 动态显存超过20%
-                # 中等动态显存压力：使用较小批次
-                # target_batch = max(self.min_batch_size, self.max_batch_size // 2)
+            if memory_usage > 0.80: 
                 target_batch = self.current_optimal_batch
                 print(f"[INFO] Medium dynamic memory usage{memory_usage:.2%}), using batch size: {target_batch}")
-            # elif dynamic_usage > 0.10:  # 动态显存超过2%
-            #     # 低动态显存压力：使用当前最优批次
-            #     target_batch = self.current_optimal_batch
-            #     print(f"[INFO] Low dynamic memory usage ({dynamic_usage:.2%}, total: {memory_usage:.2%}), using optimal batch size: {target_batch}")
-            else:  # 动态显存很少
-                # 动态显存充足：可以使用更大批次
+            else:  
                 target_batch = self.max_batch_size
                 print(f"[INFO] Minimal dynamic memory usage{memory_usage:.2%}, using max batch size: {target_batch}")
             
