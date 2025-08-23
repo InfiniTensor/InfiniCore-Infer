@@ -26,6 +26,8 @@ class InferTask:
 
     def next(self, out_token):
         self._kv_cache.update_tokens(self.tokens, self.pos)
+        recentWindow = 16
+        self.pos += min(len(self.tokens), recentWindow)
 
         self.pos += len(self.tokens)
         if out_token == None or out_token in self.end_tokens:
