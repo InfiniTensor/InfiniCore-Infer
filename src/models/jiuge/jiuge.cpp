@@ -364,14 +364,15 @@ forwardBatch(struct JiugeModel *model,
 
 void launchDevice(const JiugeMeta &meta, const JiugeWeights *weights, DeviceResource *rsrc, InferState &state, InferRequest &req,
                   infiniDevice_t device, int idev, int ndev, int dev_id, infinicclComm_t comm) {
+    // Create Device Resource
+    createDeviceResource(rsrc, &meta, weights, device, idev, ndev, dev_id, comm);
+
     CacheManager cache_manager(100);
-    InferenceContext ctx(rsrc, &cache_manager, rsrc->stream);
+    InferenceContext ctx(rsrc->handle, rsrc->memory_pool, &cache_manager, rsrc->stream);
 
     // Set the inference context for this thread
     setInferenceContext(&ctx);
 
-    // Create Device Resource
-    createDeviceResource(rsrc, &meta, weights, device, idev, ndev, dev_id, comm);
     {
         std::unique_lock<std::mutex> lock(state.mtx);
         state.loaded = true;

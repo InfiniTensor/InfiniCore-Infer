@@ -145,10 +145,13 @@ private:
     LRUDescriptorCache<infiniopRMSNormDescriptor_t> rms_norm_cache;
     LRUDescriptorCache<infiniopGemmDescriptor_t> gemm_cache;
     LRUDescriptorCache<infiniopRoPEDescriptor_t> rope_cache;
+    LRUDescriptorCache<infiniopRoPEv2Descriptor_t> rope_v2_cache;
     LRUDescriptorCache<infiniopRearrangeDescriptor_t> rearrange_cache;
     LRUDescriptorCache<infiniopCausalSoftmaxDescriptor_t> causal_softmax_cache;
+    LRUDescriptorCache<infiniopTopkrouterDescriptor_t> causal_topkrouter_cache;
     LRUDescriptorCache<infiniopSwiGLUDescriptor_t> swiglu_cache;
     LRUDescriptorCache<infiniopRandomSampleDescriptor_t> random_sample_cache;
+    LRUDescriptorCache<infiniopDequantizeDescriptor_t> dequantize_cache;
 
 public:
     CacheManager(size_t capacity = 100)
@@ -156,10 +159,13 @@ public:
           rms_norm_cache(capacity, infiniopDestroyRMSNormDescriptor),
           gemm_cache(capacity, infiniopDestroyGemmDescriptor),
           rope_cache(capacity, infiniopDestroyRoPEDescriptor),
+          rope_v2_cache(capacity, infiniopDestroyRoPEv2Descriptor),
           rearrange_cache(capacity, infiniopDestroyRearrangeDescriptor),
           causal_softmax_cache(capacity, infiniopDestroyCausalSoftmaxDescriptor),
+          causal_topkrouter_cache(capacity, infiniopDestroyTopkrouterDescriptor),
           swiglu_cache(capacity, infiniopDestroySwiGLUDescriptor),
-          random_sample_cache(capacity, infiniopDestroyRandomSampleDescriptor) {}
+          random_sample_cache(capacity, infiniopDestroyRandomSampleDescriptor),
+          dequantize_cache(capacity, infiniopDestroyDequantizeDescriptor) {}
 
     // Add operations
     bool getAddDescriptor(size_t key, infiniopAddDescriptor_t &desc) {
@@ -197,6 +203,14 @@ public:
         rope_cache.put(key, desc);
     }
 
+    bool getRoPEv2Descriptor(size_t key, infiniopRoPEv2Descriptor_t &desc) {
+        return rope_v2_cache.get(key, desc);
+    }
+
+    void putRoPEv2Descriptor(size_t key, const infiniopRoPEv2Descriptor_t &desc) {
+        rope_v2_cache.put(key, desc);
+    }
+
     // Rearrange operations
     bool getRearrangeDescriptor(size_t key, infiniopRearrangeDescriptor_t &desc) {
         return rearrange_cache.get(key, desc);
@@ -215,6 +229,15 @@ public:
         causal_softmax_cache.put(key, desc);
     }
 
+    // Topkrouter operations
+    bool getTopkrouterDescriptor(size_t key, infiniopTopkrouterDescriptor_t &desc) {
+        return causal_topkrouter_cache.get(key, desc);
+    }
+
+    void putTopkrouterDescriptor(size_t key, const infiniopTopkrouterDescriptor_t &desc) {
+        causal_topkrouter_cache.put(key, desc);
+    }
+
     // SwiGLU operations
     bool getSwiGLUDescriptor(size_t key, infiniopSwiGLUDescriptor_t &desc) {
         return swiglu_cache.get(key, desc);
@@ -231,6 +254,15 @@ public:
 
     void putRandomSampleDescriptor(size_t key, const infiniopRandomSampleDescriptor_t &desc) {
         random_sample_cache.put(key, desc);
+    }
+
+    // Dequantize operations
+    bool getDequantizeDescriptor(size_t key, infiniopDequantizeDescriptor_t &desc) {
+        return dequantize_cache.get(key, desc);
+    }
+
+    void putDequantizeDescriptor(size_t key, const infiniopDequantizeDescriptor_t &desc) {
+        dequantize_cache.put(key, desc);
     }
 
     template <typename... Tensors>

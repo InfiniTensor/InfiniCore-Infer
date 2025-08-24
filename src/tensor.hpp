@@ -101,6 +101,7 @@ public:
     static std::shared_ptr<Tensor> weight(void *host_data,
                                           infiniDtype_t dtype,
                                           const std::vector<size_t> &shape);
+    void load(void *host_data, infinirtStream_t stream = nullptr);
     std::shared_ptr<Tensor> memShare(const std::vector<size_t> &shape,
                                      infiniDtype_t dtype = INFINI_DTYPE_INVALID) const;
     std::shared_ptr<Tensor> slice(size_t dim, size_t start, size_t len);

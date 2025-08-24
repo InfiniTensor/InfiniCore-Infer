@@ -1,18 +1,18 @@
 #pragma once
 
 #include "cache_manager.hpp"
-#include "jiuge/jiuge_impl.hpp"
-#include "jiuge/jiuge_weight.hpp"
+
 #include <cassert>
 
 struct InferenceContext {
-    DeviceResource *rsrc;
+    infiniopHandle_t op_handle;
+    std::shared_ptr<MemoryPool> memory_pool;
     CacheManager *cache_manager;
     infinirtStream_t stream;
     std::shared_ptr<Storage> workspace_storage;
     size_t current_workspace_size = 0;
 
-    InferenceContext(DeviceResource *rsrc, CacheManager *cache_manager, infinirtStream_t stream);
+    InferenceContext(infiniopHandle_t op_handle, std::shared_ptr<MemoryPool> memory_pool, CacheManager *cache_manager, infinirtStream_t stream);
 
     void ensure_workspace(size_t required_size);
 
@@ -34,8 +34,21 @@ struct InferenceContext {
               std::shared_ptr<Tensor> pos,
               std::shared_ptr<Tensor> sin,
               std::shared_ptr<Tensor> cos);
+    void rope_v2(std::shared_ptr<Tensor> q,
+                 std::shared_ptr<Tensor> k,
+                 std::shared_ptr<Tensor> pos,
+                 std::shared_ptr<Tensor> sin,
+                 std::shared_ptr<Tensor> cos);
     void causalSoftmax(std::shared_ptr<Tensor> y,
                        std::shared_ptr<Tensor> x);
+
+    void topkrouter(std::shared_ptr<Tensor> values,  // F32
+                    std::shared_ptr<Tensor> indices, // I32
+                    std::shared_ptr<Tensor> x,
+                    std::shared_ptr<Tensor> correction_bias, // F32
+                    float routed_scaling_factor,
+                    size_t topk);
+
     void swiglu(std::shared_ptr<Tensor> out,
                 std::shared_ptr<Tensor> up,
                 std::shared_ptr<Tensor> gate);
@@ -49,6 +62,10 @@ struct InferenceContext {
                 float alpha, float beta,
                 std::shared_ptr<Tensor> residual,
                 std::shared_ptr<Tensor> bias);
+    void dequant(std::shared_ptr<Tensor> weight,
+                 std::shared_ptr<Tensor> in_w,
+                 std::shared_ptr<Tensor> in_s,
+                 std::shared_ptr<Tensor> in_z);
 };
 
 namespace {
@@ -88,8 +105,29 @@ inline void rope(std::shared_ptr<Tensor> q, std::shared_ptr<Tensor> k,
     getInferenceContext().rope(q, k, pos, sin, cos);
 }
 
+inline void rope_v2(std::shared_ptr<Tensor> q, std::shared_ptr<Tensor> k,
+                    std::shared_ptr<Tensor> pos, std::shared_ptr<Tensor> sin,
+                    std::shared_ptr<Tensor> cos) {
+    getInferenceContext().rope_v2(q, k, pos, sin, cos);
+}
+
 inline void causalSoftmax(std::shared_ptr<Tensor> y, std::shared_ptr<Tensor> x) {
     getInferenceContext().causalSoftmax(y, x);
+}
+
+inline void topkrouter(std::shared_ptr<Tensor> values,  // F32
+                       std::shared_ptr<Tensor> indices, // I32
+                       std::shared_ptr<Tensor> x,
+                       std::shared_ptr<Tensor> correction_bias, // F32
+                       float routed_scaling_factor,
+                       size_t topk) {
+
+    getInferenceContext().topkrouter(values,  // F32
+                                     indices, // I32
+                                     x,
+                                     correction_bias, // F32
+                                     routed_scaling_factor,
+                                     topk);
 }
 
 inline void swiglu(std::shared_ptr<Tensor> out, std::shared_ptr<Tensor> up,
@@ -106,4 +144,12 @@ inline void linear(std::shared_ptr<Tensor> c, std::shared_ptr<Tensor> a,
                    std::shared_ptr<Tensor> b, float alpha, float beta,
                    std::shared_ptr<Tensor> residual, std::shared_ptr<Tensor> bias) {
     getInferenceContext().linear(c, a, b, alpha, beta, residual, bias);
+}
+
+inline void dequant_linear(std::shared_ptr<Tensor> out, std::shared_ptr<Tensor> x,
+                           std::shared_ptr<Tensor> w_w, std::shared_ptr<Tensor> w_s, std::shared_ptr<Tensor> w_z,
+                           float alpha, float beta, std::shared_ptr<Tensor> residual, std::shared_ptr<Tensor> bias) {
+    auto w = Tensor::buffer(x->dtype(), {out->shape()[1], x->shape()[1]}, getInferenceContext().memory_pool);
+    getInferenceContext().dequant(w, w_w, w_s, w_z);
+    getInferenceContext().linear(out, x, w->permute({1, 0}), alpha, beta, residual, bias);
 }

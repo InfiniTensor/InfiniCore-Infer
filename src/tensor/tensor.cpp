@@ -154,16 +154,27 @@ std::shared_ptr<Tensor> Tensor::weight(void *data, infiniDtype_t dtype,
 
     tensor->_storage = Storage::create(size);
     tensor->_desc = TensorDesc::create(dtype, shape, strides);
-    // NOTE: 为兼容部分平台（沐曦）多线程并发对同一host数据执行memcpy卡死问题
-    static std::mutex mutex;
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        RUN_INFINI(infinirtMemcpy(tensor->_storage->memory(),
-                                  data, size, INFINIRT_MEMCPY_H2D));
+    if (data != nullptr) {
+        tensor->load(data);
     }
 
     tensor->_offset = 0;
     return tensor;
+}
+
+void Tensor::load(void *data, infinirtStream_t stream) {
+    std::cout << "Tensor::load " << this->info() << std::endl;
+    if (stream) {
+        RUN_INFINI(infinirtMemcpyAsync(this->_storage->memory(), data, this->_storage->size(), INFINIRT_MEMCPY_H2D, stream));
+        return;
+    }
+    // NOTE: 为兼容部分平台（沐曦）多线程并发对同一host数据执行memcpy卡死问题
+    static std::mutex mutex;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        RUN_INFINI(infinirtMemcpy(this->_storage->memory(),
+                                  data, this->_storage->size(), INFINIRT_MEMCPY_H2D));
+    }
 }
 
 std::shared_ptr<Tensor> Tensor::memShare(const std::vector<size_t> &shape, infiniDtype_t dtype_) const {
