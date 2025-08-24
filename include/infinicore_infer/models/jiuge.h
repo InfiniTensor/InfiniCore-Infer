@@ -35,6 +35,10 @@ typedef struct
     const void *const *attn_qkv;
     // nlayer * [ndev, (nh + 2 * nkvh) / ndev * dh]
     const void *const *attn_qkv_b;
+    // nlayer * [dh]
+    const void *const *attn_q_norm;
+    // nlayer * [dh]
+    const void *const *attn_k_norm;
     // nlayer * [ndev, d, nkvh / ndev * dh]
     const void *const *attn_o;
     // nlayer * [d]

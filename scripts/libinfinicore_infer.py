@@ -66,6 +66,8 @@ class JiugeWeightsCStruct(ctypes.Structure):
         ("attn_norm", POINTER(c_void_p)),
         ("attn_qkv", POINTER(c_void_p)),
         ("attn_qkv_b", POINTER(c_void_p)),
+        ("attn_q_norm", POINTER(c_void_p)),
+        ("attn_k_norm", POINTER(c_void_p)),
         ("attn_o", POINTER(c_void_p)),
         ("ffn_norm", POINTER(c_void_p)),
         ("ffn_gate_up", POINTER(c_void_p)),

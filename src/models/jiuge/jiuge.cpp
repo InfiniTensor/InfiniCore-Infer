@@ -21,7 +21,7 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
     infinirtStream_t stream;
     infinirtStreamCreate(&stream);
 
-    std::vector<std::shared_ptr<Tensor>> w_attn_norm, w_attn_qkv, b_attn_qkv, w_attn_out,
+    std::vector<std::shared_ptr<Tensor>> w_attn_norm, w_attn_qkv, b_attn_qkv, w_attn_q_norm, w_attn_k_norm, w_attn_out,
         w_ffn_norm, w_ffn_gate_up, w_ffn_down;
     for (size_t layer = 0; layer < meta->nlayer; layer++) {
         w_attn_norm.push_back(
@@ -31,6 +31,12 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
         if (weights->attn_qkv_b != nullptr) {
             b_attn_qkv.push_back(
                 getAttnQKVBias(meta, weights, layer, idev, ndev));
+        }
+        if (weights->attn_q_norm != nullptr) {
+            w_attn_q_norm.push_back(
+                getAttnQNorm(meta, weights, layer));
+            w_attn_k_norm.push_back(
+                getAttnKNorm(meta, weights, layer));
         }
         w_attn_out.push_back(
             getAttnO(meta, weights, layer, idev, ndev));
@@ -56,6 +62,8 @@ void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
         w_attn_norm,
         w_attn_qkv,
         b_attn_qkv,
+        w_attn_q_norm,
+        w_attn_k_norm,
         w_attn_out,
         w_ffn_norm,
         w_ffn_gate_up,
@@ -130,6 +138,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     auto dvoc = meta.dvoc;
     auto stream = rsrc.stream;
     bool has_qkv_bias = rsrc.b_attn_qkv.size() > 0;
+    bool has_qk_norm = rsrc.w_attn_q_norm.size() > 0 && rsrc.w_attn_k_norm.size() > 0;
 
     // Allocate buffers
     auto logits_in = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
@@ -141,7 +150,9 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     auto result_buf = Tensor::buffer(INFINI_DTYPE_I64, {nreq}, rsrc.memory_pool);
     auto result_cpu = std::vector<int64_t>(nreq);
 
-    auto qkv_rope = qkv_buf->view({ntok, nh + nkvh * 2, dh});
+    auto qkv_buf_view = qkv_buf->view({ntok, nh + nkvh * 2, dh});
+    auto q_buf = qkv_buf_view->slice(1, 0, nh);
+    auto k_buf = qkv_buf_view->slice(1, nh, nkvh);
 
     // Prepare inputs
     auto batch_pos_ids = std::vector<uint32_t>(ntok);
@@ -198,9 +209,13 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         rmsnorm(logits_out, logits_in, rsrc.w_attn_norm[layer], meta.epsilon);
         // qkv_proj
         linear(qkv_buf, logits_out, rsrc.w_attn_qkv[layer], 1.0, 0.0, nullptr, has_qkv_bias ? rsrc.b_attn_qkv[layer] : nullptr);
+        if (has_qk_norm) {
+            rmsnorm(q_buf, q_buf, rsrc.w_attn_q_norm[layer], meta.epsilon);
+            rmsnorm(k_buf, k_buf, rsrc.w_attn_k_norm[layer], meta.epsilon);
+        }
         // rope
-        rope(qkv_rope->slice(1, 0, nh), qkv_rope->slice(1, 0, nh), pos_ids_buf, rsrc.sin_table, rsrc.cos_table);
-        rope(qkv_rope->slice(1, nh, nkvh), qkv_rope->slice(1, nh, nkvh), pos_ids_buf, rsrc.sin_table, rsrc.cos_table);
+        rope(q_buf, q_buf, pos_ids_buf, rsrc.sin_table, rsrc.cos_table);
+        rope(k_buf, k_buf, pos_ids_buf, rsrc.sin_table, rsrc.cos_table);
 
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
@@ -208,9 +223,9 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             auto seq_len = req_lens[req];
             auto total_len = past_len + seq_len;
             auto o = o_buf->slice({{0, token_offset, seq_len}})->view({seq_len, nkvh, ngroup, dh})->permute({1, 2, 0, 3});
-            auto q = qkv_rope->slice({{0, token_offset, seq_len}, {1, 0, nh}})->view({seq_len, nkvh, ngroup, dh})->permute({1, 2, 0, 3});
-            auto k = qkv_rope->slice({{0, token_offset, seq_len}, {1, nh, nkvh}});
-            auto v = qkv_rope->slice({{0, token_offset, seq_len}, {1, nh + nkvh, nkvh}});
+            auto q = qkv_buf_view->slice({{0, token_offset, seq_len}, {1, 0, nh}})->view({seq_len, nkvh, ngroup, dh})->permute({1, 2, 0, 3});
+            auto k = qkv_buf_view->slice({{0, token_offset, seq_len}, {1, nh, nkvh}});
+            auto v = qkv_buf_view->slice({{0, token_offset, seq_len}, {1, nh + nkvh, nkvh}});
 
             // self attention
             // concat

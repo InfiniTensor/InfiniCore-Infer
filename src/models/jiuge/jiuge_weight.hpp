@@ -70,6 +70,22 @@ inline std::shared_ptr<Tensor> getAttnQKVBias(
     return Tensor::weight((char *)(w->attn_qkv_b[layer]) + offset, w->dt_mat, shape);
 }
 
+inline std::shared_ptr<Tensor> getAttnQNorm(
+    JiugeMeta const *meta,
+    JiugeWeights const *w,
+    size_t layer) {
+    auto shape = std::vector<size_t>({meta->dh});
+    return Tensor::weight((char *)(w->attn_q_norm[layer]), w->dt_norm, shape);
+}
+
+inline std::shared_ptr<Tensor> getAttnKNorm(
+    JiugeMeta const *meta,
+    JiugeWeights const *w,
+    size_t layer) {
+    auto shape = std::vector<size_t>({meta->dh});
+    return Tensor::weight((char *)(w->attn_k_norm[layer]), w->dt_norm, shape);
+}
+
 inline std::shared_ptr<Tensor> getAttnO(JiugeMeta const *meta,
                                         JiugeWeights const *w, size_t layer,
                                         size_t idev, size_t ndev) {
