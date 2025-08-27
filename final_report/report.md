@@ -8,7 +8,7 @@
 
 - 服务层优化：服务层主要针对内存管理、KV缓存池，以及批处理数量动态调整这三个方面进行了优化，在TTFT、请求速率、token生成速度等多方面取得较大的性能提升。
 
-- 稀疏注意力：在推理阶段实现了 **动态 KV Cache 管理**，通过类似**滑动窗口注意力**策略在Prefill阶段进行 **Key/Value 压缩存储**，减少显存占用，提升了解码速度。
+- 稀疏注意力：在推理阶段实现了 **动态 KV Cache 管理**，通过类似**最近窗口注意力**策略在Prefill阶段进行 **Key/Value 压缩存储**，减少显存占用，提升了解码速度。
   - **Prefill 阶段**：启用窗口裁剪（Pruning），利用了大模型注意力计算中对最近窗口的稀疏注意力关注模式，仅保留最近 `recentWindow` 长度的最近KV Cache存入KV Cache，剪裁掉了前面冗余的tokens。
   - **Decode 阶段**：基于裁剪后的 KV Cache 增量计算，避免全量计算，并将当前token新加入进KV Cache。进而大幅提高推理速度并降低了显存占用。
 ## 3. 技术亮点
@@ -72,10 +72,11 @@
 
 
 
-系统采用 **滑动窗口注意力（Sliding Window Attention）**，仅对最近 `recentWindow` 的 Token 建立全连接注意力；而较早的 Token 则通过 **压缩/裁剪策略**驱逐出KV Cache集合，从而避免了解码阶段的全量计算带来的显存和时间开销。
+系统采用 **最近窗口注意力（Sliding Window Attention）**，仅对最近 `recentWindow` 的 Token 建立全连接注意力；而较早的 Token 则通过 **压缩/裁剪策略**驱逐出KV Cache集合，从而避免了解码阶段的全量计算带来的显存和时间开销。
 具体实现：
 - **Prefill 阶段**：当输入序列长度 `seq_len > recentWindow` 时，仅保留区间 `[seq_len - recentWindow, seq_len]` 的 K/V 参与注意力计算，并将更早的部分进行截断或压缩后存入 KV Cache。
-- **Decode 阶段**：增量解码时，新增 Token 仅与窗口内和全局 Token 交互，历史缓存不再全量重复计算。
+- **Decode 阶段**：增量解码时，新增 Token 仅与窗口内token交互，历史缓存不再全量重复计算。
+- 可以通过jiuge.cpp的inferDeviceBatch中的稀疏注意力超参数**ratio**浮点数变量来改变稀疏比例（ratio表示所保留的KV Cache个数占不做裁剪的全量KV Cache的比例），以满足不同推理速度和生成精度需求。
 
 ## 4. 性能结果
 
@@ -96,7 +97,7 @@ srun python scripts/test_server.py
 * **Token生成速度**：平均每秒可生成52.91个token，相较于优化前的43.45个，提升了21.8%。
 
 稀疏注意力加速效果：
-采用128tokens的prompt 在metax GPU
+采用128tokens的prompt 在metax GPU 压缩比为12.5%
 - 加速前 (Time Per Second: 16.876ms)
 ![1](./baseline.png)
 - 加速后 (Time Per Second: 8.463ms)

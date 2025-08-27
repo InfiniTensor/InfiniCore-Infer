@@ -112,27 +112,32 @@ void releaseDeviceResource(DeviceResource &res) {
 
 void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                       uint32_t idev, uint32_t ndev,
-                      const uint32_t *tokens, uint32_t ntok, //所有req的ntokens之和
+                      const uint32_t *tokens, uint32_t ntok,
                       const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                       struct KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
                       uint32_t *output) {
+
+    // sparse attention
+    auto ratio = 0.125; // sparse ratio for kv cache
+    bool sparseOn = true;
+
     auto nlayer = meta.nlayer;
     auto nkvh = meta.nkvh / ndev;
     auto nh = meta.nh / ndev;
     auto ngroup = nh / nkvh;
     // auto dctx = meta.dctx;
     auto dh = meta.dh;
-    auto d = meta.d; //hidden size
-    auto dt_logits = meta.dt_logits; //data type
+    auto d = meta.d; // hidden size
+    auto dt_logits = meta.dt_logits; // data type
     auto di = meta.di / ndev;
     auto dvoc = meta.dvoc;
     auto stream = rsrc.stream;
     bool has_qkv_bias = rsrc.b_attn_qkv.size() > 0;
 
     // Allocate buffers
-    auto logits_in = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool); //hidden_stat
-    auto logits_out = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool); //hidden_stat (rms)
+    auto logits_in = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
+    auto logits_out = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
     auto qkv_buf = Tensor::buffer(dt_logits, {ntok, (nh + nkvh * 2) * dh}, rsrc.memory_pool);
     auto gate_up_buf = Tensor::buffer(dt_logits, {ntok, 2 * di}, rsrc.memory_pool);
     auto o_buf = Tensor::buffer(dt_logits, {ntok, nh * dh}, rsrc.memory_pool);
@@ -220,7 +225,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
     size_t max_seq_len = 0;
     o_buf->dimSplit(1, {nh, dh});
 
-    size_t recentWindow = 16; //sparse attention
+
     for (uint32_t req = 0; req < nreq; req++) {
         auto past_len = req_pos[req];
         auto seq_len = req_lens[req];
@@ -234,7 +239,9 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
         auto full_kv = kv_caches[req]->k[idev][0]->slice(0, 0, total_len)->permute({1, 2, 0});
         auto cache_kv = kv_caches[req]->k[idev][0]->slice(0, past_len, seq_len);
 
-        bool prune = (past_len == 0) && (seq_len > recentWindow);
+
+        uint32_t recentWindow = (uint32_t) (seq_len * ratio);
+        bool prune = sparseOn && (past_len == 0) && (recentWindow > 0);
 
         if (prune) {
             auto k_compressed = k->slice({{0, seq_len - recentWindow, recentWindow}});
@@ -382,19 +389,21 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
 
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
-            auto past_len = req_pos[req]; //for kv cache
+            auto past_len = req_pos[req];
             auto seq_len = req_lens[req];
             auto o = o_buf->slice({{0, token_offset, seq_len}});
             auto q = qkv_buf->slice({{0, token_offset, seq_len}, {1, 0, nh}});
             auto k = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh, nkvh}});
-            auto v = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh + nkvh, nkvh}}); //同一个req的qkv本身也储存在一起，arg2=起始位置，arg3=大小
-            //不同req的qkv存在一起,用token_offset来维护
-            bool prune = (past_len == 0) && (seq_len > recentWindow);
+            auto v = qkv_buf->slice({{0, token_offset, seq_len}, {1, nh + nkvh, nkvh}});
+
+            uint32_t recentWindow = (uint32_t) (seq_len * ratio);
+            bool prune = sparseOn && (past_len == 0) && (recentWindow > 0);
+
             // self attention
             if (prune) { // first prefill phase
                 auto k_compressed = k->slice({{0, seq_len - recentWindow, recentWindow}});
                 auto v_compressed = v->slice({{0, seq_len - recentWindow, recentWindow}});
-                //存入kv cache
+
                 RUN_INFINI(infiniopRearrange( // concat
                         desc_kv_rearranges[req],
                         kv_caches[req]->k[idev][layer]->data(past_len * nkvh * dh),
@@ -421,7 +430,7 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                 RUN_INFINI(infiniopRearrange(
                         desc_kv_rearranges[req],
                         kv_caches[req]->k[idev][layer]->data(past_len * nkvh * dh),
-                        k->data(), stream)); //加进kv cache
+                        k->data(), stream));
 
                 RUN_INFINI(infiniopRearrange(
                         desc_kv_rearranges[req],
@@ -480,7 +489,6 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
             desc_ffn_down, workspace, workspace_size,
             logits_in->data(), gate_buf->data(),
             rsrc.w_ffn_down[layer]->data(), 1.0, idev == 0 ? 1.0 : 0.0, stream)); // only rank 0 adds residual
-            // logits_in->data()即是下一层的输入
         // All_reduce if distributed
         if (rsrc.comm != nullptr) {
             RUN_INFINI(infinicclAllReduce(
@@ -573,13 +581,13 @@ inferBatch(struct JiugeModel *model,
     model->req.topk = topk;
     model->req.topp = topp;
 
-    for (size_t idev = 0; idev < model->dev_ids.size(); idev++) { //启动多设备推理
+    for (size_t idev = 0; idev < model->dev_ids.size(); idev++) {
         std::unique_lock<std::mutex> lock(model->states[idev].mtx);
         model->states[idev].proceed = true;
         lock.unlock();
-        model->states[idev].cv_start.notify_one(); //唤醒一个线程去执行推理任务
+        model->states[idev].cv_start.notify_one();
     }
-    for (size_t i = model->dev_ids.size(); i > 0; i--) { //等待推理完成
+    for (size_t i = model->dev_ids.size(); i > 0; i--) {
         auto idev = i - 1;
         std::unique_lock<std::mutex> lock(model->states[idev].mtx);
         model->states[idev].cv_done.wait(lock, [&] { return !(model->states[idev].proceed); });
