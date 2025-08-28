@@ -103,5 +103,8 @@ srun python scripts/test_server.py
 - 加速后 (Time Per Second: 8.463ms)
 ![2](./prune.png)
 
+优化后模型ppl为4.7086：
+
+![3](./ppl.png)
 
 ## 5. 时间线
