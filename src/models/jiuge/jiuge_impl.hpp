@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 
-struct DeviceResource {
+struct JiugeDeviceResource {
     // Device
     infiniDevice_t device;
     int device_id;
@@ -56,7 +56,7 @@ struct JiugeModel {
     JiugeMeta meta;
     infiniDevice_t device;
     std::vector<int> dev_ids;
-    std::vector<DeviceResource> dev_resources;
+    std::vector<JiugeDeviceResource> dev_resources;
     std::vector<InferState> states;
     std::vector<std::thread> threads;
     InferRequest req;
@@ -64,8 +64,6 @@ struct JiugeModel {
     JiugeModel(const JiugeMeta *, const JiugeWeights *, infiniDevice_t device, std::vector<int> device_ids);
 };
 
-struct KVCache {
-    std::vector<std::vector<std::shared_ptr<Tensor>>> k, v;
-};
+#include "../../cache.hpp"
 
 #endif

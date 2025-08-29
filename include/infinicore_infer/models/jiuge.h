@@ -61,20 +61,6 @@ createJiugeModel(const JiugeMeta *,
 __C __export void
 destroyJiugeModel(struct JiugeModel *);
 
-/// @brief 创建 KV Cache
-__C __export struct KVCache *
-createKVCache(const struct JiugeModel *);
-
-/// @brief 复制 KV Cache
-__C __export struct KVCache *
-duplicateKVCache(const struct JiugeModel *,
-                 const struct KVCache *, uint32_t seq_len);
-
-/// @brief 销毁 KV Cache
-__C __export void
-dropKVCache(const struct JiugeModel *,
-            struct KVCache *);
-
 /// @brief 批次推理一轮，并采样出新的 token
 /// @param tokens 输入 token 地址
 /// @param ntok 输入 token 数量
@@ -87,12 +73,12 @@ dropKVCache(const struct JiugeModel *,
 /// @param topp 采样 topp
 /// @param output 输出 token 数组，每个请求一个输出，长度至少为nreq
 __C __export void
-inferBatch(struct JiugeModel *,
-           const uint32_t *tokens, uint32_t ntok,
-           const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
-           struct KVCache **kv_caches,
-           const float *temperature, const uint32_t *topk, const float *topp,
-           uint32_t *output);
+inferBatchJiuge(struct JiugeModel *,
+                const uint32_t *tokens, uint32_t ntok,
+                const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                struct KVCache **kv_caches,
+                const float *temperature, const uint32_t *topk, const float *topp,
+                uint32_t *output);
 
 /// @brief 批次推理一轮，输出 output embedding 后的 logits
 /// @param tokens 输入 token 地址
@@ -103,10 +89,10 @@ inferBatch(struct JiugeModel *,
 /// @param kv_caches 每个请求的 KV Cache
 /// @param logits 输出 token 数组，每个请求一个输出，长度至少为nreq
 __C __export void
-forwardBatch(struct JiugeModel *,
-             const uint32_t *tokens, uint32_t ntok,
-             const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
-             struct KVCache **kv_caches,
-             void *logits);
+forwardBatchJiuge(struct JiugeModel *,
+                  const uint32_t *tokens, uint32_t ntok,
+                  const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                  struct KVCache **kv_caches,
+                  void *logits);
 
 #endif

@@ -11,8 +11,8 @@ from libinfinicore_infer import (
     destroy_jiuge_model,
     create_kv_cache,
     drop_kv_cache,
-    infer_batch,
-    forward_batch,
+    infer_batch_jiuge,
+    forward_batch_jiuge,
 )
 from infer_task import InferTask, KVCache
 
@@ -506,13 +506,15 @@ class JiugeForCauslLM:
 
         print(f"Creating model on {ndev} devices...")
         load_start_time = time.time()
-        dev_ids = (c_int * ndev)(*[i for i in range(ndev)])
+        self.dev_ids = (c_int * ndev)(*[i for i in range(ndev)])
+        self.ndev = ndev
+        self.device = device
         self.model_instance = create_jiuge_model(
             byref(self.meta),
             byref(self.weights),
             device,
             ndev,
-            dev_ids,
+            self.dev_ids,
         )
         load_end_time = time.time()
         print(f"Time used: {load_end_time - load_start_time:.3f}s")
@@ -521,15 +523,25 @@ class JiugeForCauslLM:
         return self.meta.dctx
 
     def create_kv_cache(self):
-        return create_kv_cache(self.model_instance)
+        return create_kv_cache(
+            self.meta.nlayer,
+            self.meta.dctx,
+            self.meta.nkvh,
+            self.meta.dh,
+            self.meta.dh,
+            self.meta.dt_logits,
+            self.device,
+            self.dev_ids,
+            self.ndev,
+        )
 
     def drop_kv_cache(self, kv_cache):
-        drop_kv_cache(self.model_instance, kv_cache)
+        drop_kv_cache(kv_cache)
 
     def batch_infer_one_round(self, tasks: List[InferTask]):
         output = (c_uint * len(tasks))()
         batch_inputs = JiugeBatchedTask(tasks)
-        infer_batch(
+        infer_batch_jiuge(
             self.model_instance,
             *(batch_inputs.input_args()),
             output,
@@ -609,7 +621,7 @@ class JiugeForCauslLM:
             logits = torch.zeros(
                 (batch_inputs.ntok, self.meta.dvoc), dtype=self.meta.torch_dtype_logits
             )
-            forward_batch(
+            forward_batch_jiuge(
                 self.model_instance,
                 batch_inputs.tokens,
                 batch_inputs.ntok,

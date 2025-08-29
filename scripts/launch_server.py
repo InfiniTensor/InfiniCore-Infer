@@ -1,4 +1,5 @@
 from jiuge import JiugeForCauslLM
+from jiuge_awq import JiugeAWQForCausalLM
 from libinfinicore_infer import DeviceType
 from infer_task import InferTask
 from kvcache_pool import KVCachePool
@@ -24,6 +25,7 @@ DEVICE_TYPE_MAP = {
     "metax": DeviceType.DEVICE_TYPE_METAX,
     "moore": DeviceType.DEVICE_TYPE_MOORE,
 }
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Launch the LLM inference server.")
@@ -58,18 +60,25 @@ def parse_args():
         default=None,
         help="Max token sequence length that model will handle (follows model config if not provided)",
     )
+    parser.add_argument(
+        "--awq",
+        action="store_true",
+        help="Whether to use AWQ quantized model (default: False)",
+    )
     return parser.parse_args()
+
 
 args = parse_args()
 device_type = DEVICE_TYPE_MAP[args.dev]
 model_path = args.model_path
 ndev = args.ndev
 max_tokens = args.max_tokens
-
+USE_AWQ = args.awq
 MAX_BATCH = args.max_batch
 print(
     f"Using MAX_BATCH={MAX_BATCH}. Try reduce this value if out of memory error occurs."
 )
+
 
 def chunk_json(id_, content=None, role=None, finish_reason=None):
     delta = {}
@@ -109,7 +118,14 @@ class AsyncInferTask(InferTask):
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    app.state.model = JiugeForCauslLM(model_path, device_type, ndev, max_tokens=max_tokens)
+    if USE_AWQ:
+        app.state.model = JiugeAWQForCausalLM(
+            model_path, device_type, ndev, max_tokens=max_tokens
+        )
+    else:
+        app.state.model = JiugeForCauslLM(
+            model_path, device_type, ndev, max_tokens=max_tokens
+        )
     app.state.kv_cache_pool = KVCachePool(app.state.model, MAX_BATCH)
     app.state.request_queue = janus.Queue()
     worker_thread = threading.Thread(target=worker_loop, args=(app,), daemon=True)
@@ -276,6 +292,7 @@ async def chat_completions(request: Request):
     else:
         response = await chat(id_, data, request)
         return JSONResponse(content=response)
+
 
 if __name__ == "__main__":
     uvicorn.run(App, host="0.0.0.0", port=8000)

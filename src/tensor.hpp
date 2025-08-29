@@ -2,7 +2,6 @@
 #define INFER_TENSOR_H
 
 #include "allocator.hpp"
-#include "infinicore_infer.h"
 #include "utils.hpp"
 #include <memory>
 #include <string>
@@ -101,6 +100,7 @@ public:
     static std::shared_ptr<Tensor> weight(void *host_data,
                                           infiniDtype_t dtype,
                                           const std::vector<size_t> &shape);
+    void load(const void *host_data, infinirtStream_t stream = nullptr);
     std::shared_ptr<Tensor> memShare(const std::vector<size_t> &shape,
                                      infiniDtype_t dtype = INFINI_DTYPE_INVALID) const;
     std::shared_ptr<Tensor> slice(size_t dim, size_t start, size_t len);
@@ -126,6 +126,7 @@ public:
     ptrdiff_t dataOffset() const;
     infiniDevice_t deviceType() const;
     int deviceId() const;
+    size_t numel() const;
 
     void debug(const std::string &filename) const;
     void debug() const;
