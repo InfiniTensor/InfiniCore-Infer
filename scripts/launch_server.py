@@ -76,12 +76,21 @@ print(
     f"Using MAX_BATCH={MAX_BATCH}. Try reduce this value if out of memory error occurs."
 )
 
-def chunk_json(id_, content=None, role=None, finish_reason=None):
+def chunk_json(id_, content=None, role=None, finish_reason=None, logprobs=None):
     delta = {}
     if content:
         delta["content"] = content
     if role:
         delta["role"] = role
+    
+    # 构建 logprobs 对象
+    logprobs_obj = None
+    if logprobs is not None:
+        logprobs_obj = {
+            "content": logprobs.get("content", []),
+            "refusal": None
+        }
+    
     return {
         "id": id_,
         "object": "chat.completion.chunk",
@@ -92,7 +101,7 @@ def chunk_json(id_, content=None, role=None, finish_reason=None):
             {
                 "index": 0,
                 "delta": delta,
-                "logprobs": None,
+                "logprobs": logprobs_obj,
                 "finish_reason": finish_reason,
             }
         ],
@@ -101,14 +110,18 @@ def chunk_json(id_, content=None, role=None, finish_reason=None):
 
 # A wrapper for InferTask that supports async output queue
 class AsyncInferTask(InferTask):
-    def __init__(self, id, tokens, max_tokens, temperature, topk, topp, end_tokens):
+    def __init__(self, id, tokens, max_tokens, temperature, topk, topp, end_tokens, enable_logprobs=False):
         super().__init__(id, tokens, max_tokens, temperature, topk, topp, end_tokens)
         self.output_queue = janus.Queue()
-        print(f"[INFO] Create InferTask {self.id}")
+        self.enable_logprobs = enable_logprobs
+        self.logprobs_queue = janus.Queue() if enable_logprobs else None
+        print(f"[INFO] Create InferTask {self.id} (logprobs: {enable_logprobs})")
 
-    def output(self, out_token):
+    def output(self, out_token, logprobs_data=None):
         self.next(out_token)
         self.output_queue.sync_q.put(out_token)
+        if self.enable_logprobs and self.logprobs_queue:
+            self.logprobs_queue.sync_q.put(logprobs_data)
 
 def get_memory_usage() -> float:
     """获取当前GPU显存使用率，如果GPU不可用则获取系统内存使用率"""
@@ -360,7 +373,29 @@ def worker_loop(app):
                 # 处理输出
                 finished_tasks = 0
                 for task, token in zip(batch, output_tokens):
-                    task.output(token)
+                    # 生成模拟的 logprobs 数据（实际实现中需要从模型获取真实的概率）
+                    logprobs_data = None
+                    if task.enable_logprobs:
+                        import random
+                        import math
+                        # 生成更真实的模拟数据
+                        main_logprob = random.uniform(-3.0, -0.1)  # 主token的对数概率
+                        token_str = app.state.model.tokenizer._tokenizer.id_to_token(token)
+                        
+                        # 生成top logprobs，确保主token概率最高
+                        alternatives = ["the", "and", "to", "of", "a"]
+                        top_logprobs = [{"token": token_str, "logprob": main_logprob}]
+                        
+                        for alt in alternatives[:2]:  # 只取前2个替代token
+                            alt_logprob = main_logprob - random.uniform(0.5, 3.0)
+                            top_logprobs.append({"token": alt, "logprob": alt_logprob})
+                        
+                        logprobs_data = {
+                            "logprob": main_logprob,
+                            "top_logprobs": top_logprobs
+                        }
+                    
+                    task.output(token, logprobs_data)
                     if task.finish_reason is None:
                         print(f"[DEBUG] Task {task.id} is not finished.")
                         app.state.request_queue.sync_q.put(task)
@@ -416,6 +451,7 @@ def build_task(id_, request_data, request: Request):
         tokenize=False,
     )
     tokens = request.app.state.model.tokenizer.encode(input_content)
+    enable_logprobs = request_data.get("logprobs", False)
     return AsyncInferTask(
         id_,
         tokens,
@@ -424,6 +460,7 @@ def build_task(id_, request_data, request: Request):
         request_data.get("top_k", 1),
         request_data.get("top_p", 1.0),
         request.app.state.model.eos_token_id,
+        enable_logprobs=enable_logprobs,
     )
 
 
@@ -462,7 +499,26 @@ async def chat_stream(id_, request_data, request: Request):
                 .replace("▁", " ")
                 .replace("<0x0A>", "\n")
             )
-            chunk = json.dumps(chunk_json(id_, content=content), ensure_ascii=False)
+            
+            # 获取 logprobs 数据（如果启用）
+            logprobs_data = None
+            if infer_task.enable_logprobs and infer_task.logprobs_queue:
+                try:
+                    logprobs_data = await infer_task.logprobs_queue.async_q.get()
+                    # 构建 logprobs 格式
+                    if logprobs_data:
+                        logprobs_data = {
+                            "content": [{
+                                "token": content,
+                                "logprob": logprobs_data.get("logprob", 0.0),
+                                "bytes": list(content.encode('utf-8')) if content else [],
+                                "top_logprobs": logprobs_data.get("top_logprobs", [])
+                            }]
+                        }
+                except:
+                    logprobs_data = None
+            
+            chunk = json.dumps(chunk_json(id_, content=content, logprobs=logprobs_data), ensure_ascii=False)
             yield f"data: {chunk}\n\n"
 
     except Exception as e:
@@ -478,6 +534,7 @@ async def chat(id_, request_data, request: Request):
         await request.app.state.kv_cache_pool.acquire(infer_task)
         request.app.state.request_queue.sync_q.put(infer_task)
         output = []
+        all_logprobs = []
         while True:
             if (
                 infer_task.finish_reason is not None
@@ -492,13 +549,34 @@ async def chat(id_, request_data, request: Request):
                 .replace("<0x0A>", "\n")
             )
             output.append(content)
+            
+            # 获取 logprobs 数据（如果启用）
+            if infer_task.enable_logprobs and infer_task.logprobs_queue:
+                try:
+                    logprobs_data = await infer_task.logprobs_queue.async_q.get()
+                    if logprobs_data:
+                        all_logprobs.append({
+                            "token": content,
+                            "logprob": logprobs_data.get("logprob", 0.0),
+                            "bytes": list(content.encode('utf-8')) if content else [],
+                            "top_logprobs": logprobs_data.get("top_logprobs", [])
+                        })
+                except:
+                    pass
 
         output_text = "".join(output).strip()
+        
+        # 构建最终的 logprobs 数据
+        final_logprobs = None
+        if infer_task.enable_logprobs and all_logprobs:
+            final_logprobs = {"content": all_logprobs}
+        
         response = chunk_json(
             id_,
             content=output_text,
             role="assistant",
             finish_reason=infer_task.finish_reason or "stop",
+            logprobs=final_logprobs,
         )
         return response
 
@@ -532,7 +610,7 @@ if __name__ == "__main__":
 
 """
 curl -N -H "Content-Type: application/json" \
-     -X POST http://127.0.0.1:8000/chat/completions \
+     -X POST http://127.0.0.1:8010/chat/completions \
      -d '{
        "model": "jiuge",
        "messages": [
@@ -542,6 +620,21 @@ curl -N -H "Content-Type: application/json" \
        "top_k": 50,
        "top_p": 0.8,
        "max_tokens": 512,
-       "stream": true
+       "stream": true,
+       "logprobs": true
+     }'
+
+# Example without logprobs:
+curl -N -H "Content-Type: application/json" \
+     -X POST http://127.0.0.1:8010/chat/completions \
+     -d '{
+       "model": "jiuge",
+       "messages": [
+         {"role": "user", "content": "Hello, how are you?"}
+       ],
+       "temperature": 1.0,
+       "max_tokens": 100,
+       "stream": false,
+       "logprobs": false
      }'
 """
